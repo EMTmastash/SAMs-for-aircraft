@@ -6,6 +6,9 @@ public class RadarSARHSeeker : MissileSeeker
 {
 	public override void Initialize(Unit target, GlobalPosition aimpoint)
 	{
+		this.bvrSettings = ResolveBvrSettings?.Invoke(this.missile);
+		this.relockPending = false;
+		this.relockAttemptsUsed = 0;
 		Unit unit = null;
 		if (this.missile.owner != null)
 		{
@@ -118,12 +121,17 @@ public class RadarSARHSeeker : MissileSeeker
 		{
 			this.radarSource.RemoveGuidedMissile(this.missile);
 		}
+		this.relockPending = false;
+		this.StopCountermeasureTracking();
+		this.missile.onDisableUnit -= this.SARHSeeker_OnDisable;
+	}
+	private void StopCountermeasureTracking()
+	{
 		this.missile.onJam -= this.SARHSeeker_OnJam;
 		if (this.targetUnit != null)
 		{
 			this.targetUnit.onAddRadarChaff -= this.SARHSeeker_OnChaff;
 		}
-		this.missile.onDisableUnit -= this.SARHSeeker_OnDisable;
 	}
 	private float RangeCoef(float targetDistance)
 	{
@@ -133,7 +141,7 @@ public class RadarSARHSeeker : MissileSeeker
 	}
 	private float GetTrackingStrength(Unit targetUnit)
 	{
-		if (Time.timeSinceLevelLoad - this.lastTrackingCheck < 0.2f)
+		if (Time.timeSinceLevelLoad - this.lastTrackingCheck < TrackingSampleInterval)
 		{
 			return this.trackingStrength;
 		}
@@ -187,20 +195,80 @@ public class RadarSARHSeeker : MissileSeeker
 		{
 			this.missile.NetworkseekerMode = Missile.SeekerMode.activeSearch;
 		}
-		if (this.timeWithoutTrack > this.lockPersistence)
+		if (this.timeWithoutTrack > (this.bvrSettings?.Persistence ?? this.lockPersistence))
 		{
 			this.targetTransform = null;
 			this.missile.SetTarget(null);
-			this.missile.onJam -= this.SARHSeeker_OnJam;
-			if (this.targetUnit != null)
+			if (this.bvrSettings?.RelockDelay is float delay && this.targetUnit != null && !this.targetUnit.disabled)
 			{
-				this.targetUnit.onAddRadarChaff -= this.SARHSeeker_OnChaff;
+				this.relockPending = true;
+				this.nextRelockAt = Time.timeSinceLevelLoad + delay;
+			}
+			else
+			{
+				this.StopCountermeasureTracking();
 			}
 			return;
 		}
 		this.timeWithoutTrack += Time.fixedDeltaTime;
 		this.knownPos += this.knownVel * Time.fixedDeltaTime;
 		this.knownAccel = Vector3.zero;
+	}
+	private void DecayJam()
+	{
+		this.jamAccumulation -= Mathf.Max(this.jamAccumulation, 0.2f) * Mathf.Max(this.jamTolerance, 0.1f) * Time.fixedDeltaTime;
+		this.jamAccumulation = Mathf.Clamp01(this.jamAccumulation);
+	}
+	private void TryRelock()
+	{
+		if (this.targetUnit == null || this.targetUnit.disabled || this.missile.owner == null || this.missile.owner.disabled)
+		{
+			this.relockPending = false;
+			this.StopCountermeasureTracking();
+			return;
+		}
+
+		// Keep receiving missile ECM during the retry window. Search mode ignores chaff.
+		this.DecayJam();
+		float now = Time.timeSinceLevelLoad;
+		if (now < this.nextRelockAt || now - this.lastTrackingCheck < TrackingSampleInterval)
+		{
+			return;
+		}
+
+		this.relockAttemptsUsed++;
+		float signal = this.GetTrackingStrength(this.targetUnit);
+		if (signal > 0f && signal >= this.radarParams.minSignal)
+		{
+			Transform part = this.targetUnit.GetRandomPart();
+			if (part != null)
+			{
+				this.targetTransform = part;
+				if (this.proximityFuse)
+				{
+					this.missile.SetProxyFuse(part, this.targetUnit.rb);
+				}
+				this.knownVelPrev = this.targetUnit.rb != null ? this.targetUnit.rb.velocity : Vector3.zero;
+				this.AcquireLock();
+				return;
+			}
+		}
+
+		if (this.bvrSettings.RelockAttempts > 0 && this.relockAttemptsUsed >= this.bvrSettings.RelockAttempts)
+		{
+			this.relockPending = false;
+			this.StopCountermeasureTracking();
+			return;
+		}
+		this.nextRelockAt = now + this.bvrSettings.RelockDelay.Value;
+	}
+	private void AcquireLock()
+	{
+		this.missile.SetTarget(this.targetUnit);
+		this.timeWithoutTrack = 0f;
+		this.relockPending = false;
+		this.relockAttemptsUsed = 0;
+		this.LockedMode();
 	}
 	private void LockedMode()
 	{
@@ -239,13 +307,10 @@ public class RadarSARHSeeker : MissileSeeker
 		}
 		if (this.targetTransform != null && this.targetUnit != null)
 		{
-			this.jamAccumulation -= Mathf.Max(this.jamAccumulation, 0.2f) * Mathf.Max(this.jamTolerance, 0.1f) * Time.deltaTime;
-			this.jamAccumulation = Mathf.Clamp01(this.jamAccumulation);
+			this.DecayJam();
 			if (this.GetTrackingStrength(this.targetUnit) >= this.radarParams.minSignal)
 			{
-				this.missile.SetTarget(this.targetUnit);
-				this.timeWithoutTrack = 0f;
-				this.LockedMode();
+				this.AcquireLock();
 			}
 			else
 			{
@@ -255,6 +320,10 @@ public class RadarSARHSeeker : MissileSeeker
 		else
 		{
 			this.knownPos += this.knownVel * Time.fixedDeltaTime;
+			if (this.relockPending)
+			{
+				this.TryRelock();
+			}
 			if (this.targetUnit == null && this.missile.IsArmed())
 			{
 				this.missile.Detonate(this.missile.rb.velocity, false, false);
@@ -264,7 +333,7 @@ public class RadarSARHSeeker : MissileSeeker
 	}
 	private bool RadarSupportsTarget()
 	{
-		if (this.missile.owner == null || this.missile.owner.disabled || this.targetUnit == null || this.targetUnit.disabled || this.targetTransform == null || this.radarSource == null || this.radarSourcePoint == null || !this.radarSource.activated || !this.radarSource.IsOperational() || this.missile.owner.radar != this.radarSource || this.radarSource.GetAttachedUnit() != this.missile.owner)
+		if (this.missile.owner == null || this.missile.owner.disabled || this.targetUnit == null || this.targetUnit.disabled || this.radarSource == null || this.radarSourcePoint == null || !this.radarSource.activated || !this.radarSource.IsOperational() || this.missile.owner.radar != this.radarSource || this.radarSource.GetAttachedUnit() != this.missile.owner)
 		{
 			return false;
 		}
@@ -285,6 +354,27 @@ public class RadarSARHSeeker : MissileSeeker
 	}
 
 	private static readonly FieldInfo RadarConeField = typeof(Radar).GetField("radarCone", BindingFlags.Instance | BindingFlags.NonPublic);
+	private const float TrackingSampleInterval = 0.2f;
+
+	internal static Func<Missile, BvrSettings> ResolveBvrSettings;
+	internal sealed class BvrSettings
+	{
+		internal readonly float? Persistence;
+		internal readonly float? RelockDelay;
+		internal readonly int RelockAttempts;
+
+		internal BvrSettings(float? persistence, float? relockDelay, int relockAttempts)
+		{
+			this.Persistence = persistence;
+			this.RelockDelay = relockDelay;
+			this.RelockAttempts = relockAttempts;
+		}
+	}
+
+	private BvrSettings bvrSettings;
+	private bool relockPending;
+	private float nextRelockAt;
+	private int relockAttemptsUsed;
 
 	[SerializeField]
 	private float lockPersistence = 2f;
