@@ -3,7 +3,7 @@ using System.IO;
 using BepInEx;
 using UnityEngine;
 
-[BepInPlugin("aaa.local.nuclearoption.radarsarhloader", "SAMs for Aircraft SARH", "0.2.8")]
+[BepInPlugin("aaa.local.nuclearoption.radarsarhloader", "SAMs for Aircraft SARH", "0.3.0")]
 [BepInProcess("NuclearOption.exe")]
 [DefaultExecutionOrder(20000)]
 public sealed class RadarSARHSingleFilePlugin : BaseUnityPlugin
